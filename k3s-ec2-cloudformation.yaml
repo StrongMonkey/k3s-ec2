@@ -1,0 +1,145 @@
+Resources:
+  K3sClusterInit:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: !Ref K3SInstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds: 
+      - !Ref K3sSecurityGroup
+      UserData: 
+        Fn::Base64: !Sub 
+        - |- 
+          #!/bin/bash
+          curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} INSTALL_K3S_EXEC="--cluster-init --tls-san ${K3S_SERVER_URL}" sh -
+        - K3S_TOKEN: !Ref K3SToken
+          K3S_SERVER_URL: !GetAtt K3sNLB.DNSName
+  K3sASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties: 
+      AutoScalingGroupName: "k3s-asg"
+      AvailabilityZones: !GetAZs ''
+      MinSize: '2'
+      MaxSize: '20'
+      TargetGroupARNs: 
+      - !Ref K3sASGTarget
+      LaunchTemplate:
+        LaunchTemplateId: !Ref K3sLaunchTemplate
+        Version: "1"
+      HealthCheckGracePeriod: 3000000
+  K3sLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties: 
+      LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
+      LaunchTemplateData: 
+        ImageId: !Ref AMI
+        InstanceType: !Ref K3SInstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds: 
+        - !Ref K3sSecurityGroup
+        UserData: 
+          Fn::Base64: !Sub 
+          - |-
+            #!/bin/bash
+            while [ ! $(curl -s https://${K3S_SERVER_URL}) ]
+            do
+              curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} INSTALL_K3S_EXEC="--server https://${K3S_SERVER_URL}" sh -
+              sleep 15
+            done
+          - K3S_TOKEN: !Ref K3SToken
+            K3S_SERVER_URL: !GetAtt K3sNLB.DNSName
+  K3sNLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "k3s-nlb"
+      Type: "network"
+      Subnets:
+      - !Ref Subnet
+  K3sListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref K3sASGTarget
+      LoadBalancerArn: !Ref K3sNLB
+      Port: 443
+      Protocol: TCP
+  K3sASGTarget:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Protocol: TCP
+      TargetType: instance
+      Targets:
+      - Id: !Ref K3sClusterInit
+      Port: 6443
+      VpcId: !Ref VPC
+  K3sSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "K3s cluster security group"
+      VpcId: !Ref VPC
+  K3sSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K3sSecurityGroup
+      IpProtocol: udp
+      FromPort: 8472
+      ToPort: 8472
+      SourceSecurityGroupId: !Ref K3sSecurityGroup
+  K3sSecurityGroupIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K3sSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6443
+      ToPort: 6443
+      CidrIp: 0.0.0.0/0
+  K3sSecurityGroupIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K3sSecurityGroup
+      IpProtocol: tcp
+      FromPort: 10250
+      ToPort: 10250
+      CidrIp: 0.0.0.0/0
+  K3sSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref K3sSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+        
+
+Parameters:
+  K3SInstanceType:
+    Description: Specify autoscaling group instance type
+    Type: String
+    Default: t2.medium
+  AMI:
+    Description: Specify AMI
+    Type: String
+    Default: ami-003634241a8fcdec0 # ubuntu 18.04 on us-west-2
+  VPC:
+    Description: Specify VPC
+    Type: String
+    Default: vpc-20c90758 # default VPC on us-west-2
+  Subnet:
+    Description: Specify Subnet ID
+    Type: String
+    Default: subnet-982309c2
+  KeyPairName:
+    Description: Specify keypair name to ssh into instances
+    Type: String
+    Default: daishan
+  K3SToken:
+    Description: Specify a k3s secret token to join HA cluster
+    Type: String
+
+  
+  
+  
+  
+
+        

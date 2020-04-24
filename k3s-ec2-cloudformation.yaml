@@ -1,19 +1,17 @@
 Resources:
-  K3sClusterInit:
-    Type: AWS::EC2::Instance
+  K3sClusterInitASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      ImageId: !Ref AMI
-      InstanceType: !Ref K3SInstanceType
-      KeyName: !Ref KeyPairName
-      SecurityGroupIds: 
-      - !Ref K3sSecurityGroup
-      UserData: 
-        Fn::Base64: !Sub 
-        - |- 
-          #!/bin/bash
-          curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} INSTALL_K3S_EXEC="--cluster-init --tls-san ${K3S_SERVER_URL}" sh -
-        - K3S_TOKEN: !Ref K3SToken
-          K3S_SERVER_URL: !GetAtt K3sNLB.DNSName
+      AutoScalingGroupName: "k3s-asg-init"
+      AvailabilityZones: !GetAZs ''
+      MinSize: '1'
+      MaxSize: '1'
+      TargetGroupARNs: 
+      - !Ref K3sASGTarget
+      LaunchTemplate:
+        LaunchTemplateId: !Ref K3sLaunchTemplateInitASG
+        Version: "1"
+      HealthCheckGracePeriod: 3000000
   K3sASG:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties: 
@@ -24,37 +22,357 @@ Resources:
       TargetGroupARNs: 
       - !Ref K3sASGTarget
       LaunchTemplate:
-        LaunchTemplateId: !Ref K3sLaunchTemplate
+        LaunchTemplateId: !Ref K3sLaunchTemplateASG
         Version: "1"
       HealthCheckGracePeriod: 3000000
-  K3sLaunchTemplate:
+    DependsOn: K3sClusterInitASG
+  K3sASGWorker:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties: 
+      AutoScalingGroupName: "k3s-asg-workers"
+      AvailabilityZones: !GetAZs ''
+      MinSize: '3'
+      MaxSize: '3'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref K3sLaunchTemplateASGWorker
+        Version: "1"
+      HealthCheckGracePeriod: 3000000
+    DependsOn: K3sASG
+  K3sLaunchTemplateASG:
     Type: AWS::EC2::LaunchTemplate
     Properties: 
       LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
       LaunchTemplateData: 
         ImageId: !Ref AMI
+        IamInstanceProfile:
+          Arn: !Ref Arn
         InstanceType: !Ref K3SInstanceType
         KeyName: !Ref KeyPairName
         SecurityGroupIds: 
         - !Ref K3sSecurityGroup
+        TagSpecifications:
+        - ResourceType: instance
+          Tags:
+          - Key: k3s-peer
+            Value: true
+          - Key: !Sub
+            - "kubernetes.io/cluster/${CLUSTER_ID}"
+            - CLUSTER_ID: !Ref K3SClusterID
+            Value: owned
         UserData: 
           Fn::Base64: !Sub 
           - |-
             #!/bin/bash
-            while [ ! $(curl -s https://${K3S_SERVER_URL}) ]
+            set -e
+            set -x
+
+            # find peer IP, if peer IP is not available then use init IP
+            curl -sfL https://github.com/StrongMonkey/go-discover/releases/download/v0.0.1/go-discover > /usr/local/bin/go-discover && chmod +x /usr/local/bin/go-discover
+            initIP=$(go-discover -q addrs provider=aws tag_key=k3s-init tag_value=true)
+            peerIPs=$(go-discover -q addrs provider=aws tag_key=k3s-peer tag_value=true)
+            joinIP=$initIP
+            for ip in $peerIPs
             do
-              curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} INSTALL_K3S_EXEC="--server https://${K3S_SERVER_URL}" sh -
+              if [[ $(curl -sk https://$ip:6443) ]]; then
+                joinIP=$ip
+              fi
+            done
+
+            # fallback to init cluster IP if no peer is available and initIP can't be found
+            while [ -z $joinIP ]
+            do
+              sleep 5
+              joinIP=$(go-discover -q addrs provider=aws tag_key=k3s-init tag_value=true)
+            done
+
+            # join cluster
+            while [ ! $(curl -s https://$joinIP:6443) ]
+            do
+              curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} INSTALL_K3S_EXEC="--no-deploy servicelb --disable-cloud-controller --kubelet-arg="cloud-provider=external" --kubelet-arg="provider-id=aws:///$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)/$(curl -s http://169.254.169.254/latest/meta-data/instance-id)" --server https://$joinIP:6443" sh -
               sleep 15
             done
+
           - K3S_TOKEN: !Ref K3SToken
+  K3sLaunchTemplateInitASG:
+    Type: AWS::EC2::LaunchTemplate
+    Properties: 
+      LaunchTemplateName: !Sub ${AWS::StackName}-init-launch-template
+      LaunchTemplateData: 
+        ImageId: !Ref AMI
+        InstanceType: !Ref K3SInstanceType
+        IamInstanceProfile:
+          Arn: !Ref Arn
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds: 
+        - !Ref K3sSecurityGroup
+        TagSpecifications:
+        - ResourceType: instance
+          Tags:
+          - Key: k3s-init
+            Value: true
+          - Key: !Sub
+            - "kubernetes.io/cluster/${CLUSTER_ID}"
+            - CLUSTER_ID: !Ref K3SClusterID
+            Value: owned
+        UserData: 
+          Fn::Base64: !Sub 
+          - |-
+            #!/bin/bash
+            set -e
+            set -x
+
+            # Prepare Certificate
+            mkdir -p /var/lib/rancher/k3s/server/tls
+            echo "${K3S_CA_CERT}" > /var/lib/rancher/k3s/server/tls/server-ca.crt
+            echo "${K3S_CA_KEY}" > /var/lib/rancher/k3s/server/tls/server-ca.key
+            echo "${K3S_CLIENT_CERT}" > /var/lib/rancher/k3s/server/tls/client-ca.crt
+            echo "${K3D_CLIENT_KEY}" > /var/lib/rancher/k3s/server/tls/client-ca.key
+
+            # Prepare Manifest
+            mkdir -p /var/lib/rancher/k3s/server/manifests
+            cat > /var/lib/rancher/k3s/server/manifests/aws-cloud-provider.yaml << EOF
+            ---
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: aws-cloud-controller-manager
+              namespace: kube-system
+            spec:
+              replicas: 1
+              revisionHistoryLimit: 2
+              selector:
+                matchLabels:
+                  app: aws-cloud-controller-manager
+              template:
+                metadata:
+                  labels:
+                    app: aws-cloud-controller-manager
+                  annotations:
+                    scheduler.alpha.kubernetes.io/critical-pod: ''
+                spec:
+                  dnsPolicy: Default
+                  hostNetwork: true
+                  serviceAccountName: cloud-controller-manager
+                  tolerations:
+                    # this taint is set by all kubelets running `--cloud-provider=external`
+                    # so we should tolerate it to schedule the aws ccm
+                    - key: "node.cloudprovider.kubernetes.io/uninitialized"
+                      value: "true"
+                      effect: "NoSchedule"
+                    - key: "CriticalAddonsOnly"
+                      operator: "Exists"
+                    # cloud controller manages should be able to run on masters
+                    - key: "node-role.kubernetes.io/master"
+                      effect: NoSchedule
+                  containers:
+                  - image: strongmonkey1992/aws-cloud-controller-manager:dev
+                    name: aws-cloud-controller-manager
+                    command:
+                      - "/bin/aws-cloud-controller-manager"
+                      - "--leader-elect=true"
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 50Mi
+
+            ---
+            apiVersion: v1
+            kind: ServiceAccount
+            metadata:
+              name: cloud-controller-manager
+              namespace: kube-system
+            ---
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRole
+            metadata:
+              annotations:
+                rbac.authorization.kubernetes.io/autoupdate: "true"
+              name: system:cloud-controller-manager
+            rules:
+            - apiGroups:
+              - ""
+              resources:
+              - events
+              verbs:
+              - create
+              - patch
+              - update
+            - apiGroups:
+              - ""
+              resources:
+              - nodes
+              verbs:
+              - '*'
+            - apiGroups:
+              - ""
+              resources:
+              - nodes/status
+              verbs:
+              - patch
+            - apiGroups:
+              - ""
+              resources:
+              - services
+              verbs:
+              - list
+              - patch
+              - update
+              - watch
+            - apiGroups:
+              - ""
+              resources:
+              - services/status
+              verbs:
+              - list
+              - patch
+              - update
+              - watch
+            - apiGroups:
+              - ""
+              resources:
+              - serviceaccounts
+              verbs:
+              - create
+            - apiGroups:
+              - ""
+              resources:
+              - persistentvolumes
+              verbs:
+              - get
+              - list
+              - update
+              - watch
+            - apiGroups:
+              - ""
+              resources:
+              - endpoints
+              verbs:
+              - create
+              - get
+              - list
+              - watch
+              - update
+            - apiGroups:
+              - ""
+              resources:
+              - configmaps
+              verbs:
+              - list
+              - patch
+              - update
+              - watch
+              - get
+            - apiGroups:
+              - "coordination.k8s.io"
+              resources:
+              - leases
+              verbs:
+              - create
+              - get
+              - list
+              - watch
+              - update 
+            ---
+            kind: ClusterRoleBinding
+            apiVersion: rbac.authorization.k8s.io/v1
+            metadata:
+              name: system:cloud-controller-manager
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: system:cloud-controller-manager
+            subjects:
+            - kind: ServiceAccount
+              name: cloud-controller-manager
+              namespace: kube-system
+            EOF
+
+            cat > /var/lib/rancher/k3s/server/manifests/ebs-cis-driver.yaml << EOF
+            apiVersion: helm.cattle.io/v1
+            kind: HelmChart
+            metadata:
+              name: ebs-cis-driver
+              namespace: kube-system
+            spec:
+              chart: https://github.com/kubernetes-sigs/aws-ebs-csi-driver/releases/download/v0.5.0/helm-chart.tgz
+              set:
+                enableVolumeScheduling: "true"
+                enableVolumeResizing: "true"
+                enableVolumeSnapshot: "true"
+            EOF
+
+
+            curl -sfL https://get.k3s.io | K3S_TOKEN=${K3S_TOKEN} K3S_AGENT_TOKEN=${K3S_AGENT_TOKEN} INSTALL_K3S_EXEC="--no-deploy servicelb --disable-cloud-controller --kubelet-arg="cloud-provider=external" --kubelet-arg="provider-id=aws:///$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)/$(curl -s http://169.254.169.254/latest/meta-data/instance-id)" --cluster-init --tls-san ${K3S_SERVER_URL}" sh -
+          - K3S_TOKEN: !Ref K3SToken
+            K3S_AGENT_TOKEN: !Ref K3SAgentToken
+            K3S_CA_CERT: !Ref K3SCACrt
+            K3S_CA_KEY: !Ref K3SCAKey
+            K3S_CLIENT_CERT: !Ref K3sClientCrt
+            K3D_CLIENT_KEY: !Ref K3SClientKey
             K3S_SERVER_URL: !GetAtt K3sNLB.DNSName
+  K3sLaunchTemplateASGWorker:
+    Type: AWS::EC2::LaunchTemplate
+    Properties: 
+      LaunchTemplateName: !Sub ${AWS::StackName}-worker-launch-template
+      LaunchTemplateData: 
+        ImageId: !Ref AMI
+        InstanceType: !Ref K3SInstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Arn: !Ref Arn
+        SecurityGroupIds: 
+        - !Ref K3sSecurityGroup
+        TagSpecifications:
+        - ResourceType: instance
+          Tags:
+          - Key: k3s-worker
+            Value: true
+          - Key: !Sub 
+            - "kubernetes.io/cluster/${CLUSTER_ID}"
+            - CLUSTER_ID: !Ref K3SClusterID
+            Value: owned
+        UserData: 
+          Fn::Base64: !Sub 
+          - |-
+            #!/bin/bash
+            set -e
+            set -x
+
+            curl -sfL https://get.k3s.io | K3S_URL=https://${K3S_SERVER_URL} K3S_TOKEN=${K3S_TOKEN} INSTALL_K3S_EXEC="--kubelet-arg="cloud-provider=external" --kubelet-arg="provider-id=aws:///$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)/$(curl -s http://169.254.169.254/latest/meta-data/instance-id)"" sh -
+          - K3S_TOKEN: !Ref K3SAgentToken
+            K3S_SERVER_URL: !GetAtt K3sNLB.DNSName
+  # K3sIAMProfile:
+  #   Type: AWS::IAM::InstanceProfile
+  #   Properties: 
+  #     Roles: 
+  #     - !Ref K3sIAMDiscoverRole
+  # K3sIAMDiscoverRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     AssumeRolePolicyDocument:
+  #       Version: "latest"
+  #       Statement: 
+  #       - Effect: "Allow"
+  #         Principal: 
+  #           Service: 
+  #           - "ec2.amazonaws.coadmin.kubeconfigm"
+  #         Action: 
+  #         - "sts:AssumeRole"
+  #     Path: "/"
+  #     Policies:
+  #     - PolicyName: discover
+  #       PolicyDocument:
+  #         Version: "latest"
+  #         Statement:
+  #         - Effect: Allow
+  #           Action: 'ec2:DescribeInstances'
+  #           Resource: '*'
   K3sNLB:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
       Name: "k3s-nlb"
       Type: "network"
-      Subnets:
-      - !Ref Subnet
+      Subnets: !Ref Subnet
   K3sListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -69,8 +387,6 @@ Resources:
     Properties:
       Protocol: TCP
       TargetType: instance
-      Targets:
-      - Id: !Ref K3sClusterInit
       Port: 6443
       VpcId: !Ref VPC
   K3sSecurityGroup:
@@ -127,14 +443,35 @@ Parameters:
     Default: vpc-20c90758 # default VPC on us-west-2
   Subnet:
     Description: Specify Subnet ID
-    Type: String
-    Default: subnet-982309c2
+    Type: CommaDelimitedList
+    Default: "subnet-d51a41ac,subnet-ee8bcea5,subnet-982309c2,subnet-879665ac"
   KeyPairName:
     Description: Specify keypair name to ssh into instances
     Type: String
     Default: daishan
   K3SToken:
     Description: Specify a k3s secret token to join HA cluster
+    Type: String
+  K3SAgentToken:
+    Description: K3s agent token to join as worker node
+    Type: String
+  K3SCACrt:
+    Description: K3s CA certificate
+    Type: String
+  K3SCAKey:
+    Description: K3s CA private key
+    Type: String
+  K3sClientCrt:
+    Description: K3s client certificate
+    Type: String
+  K3SClientKey:
+    Description: k3s client private key
+    Type: String
+  Arn:
+    Description: Instance IAM profile ARN
+    Type: String
+  K3SClusterID:
+    Description: ClusterID
     Type: String
 
   

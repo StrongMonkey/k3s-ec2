@@ -1,0 +1,11 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: ebs-cis-driver
+  namespace: kube-system
+spec:
+  chart: https://github.com/kubernetes-sigs/aws-ebs-csi-driver/releases/download/v0.5.0/helm-chart.tgz
+  set:
+    enableVolumeScheduling: "true"
+    enableVolumeResizing: "true"
+    enableVolumeSnapshot: "true"
